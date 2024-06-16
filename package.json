@@ -1,0 +1,19 @@
+{
+  "name": "google-takeout",
+  "module": "index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "tsx ./index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "date-fns": "^3.6.0",
+    "exiftool-vendored": "^27.0.0",
+    "tsx": "^4.15.5"
+  }
+}
