@@ -1,6 +1,8 @@
 import fs from "fs";
 import path from "path";
 import { exiftool, ExifDateTime } from "exiftool-vendored";
+import { fromUnixTime, parseISO } from "date-fns";
+import { SingleBar } from "cli-progress";
 
 async function* walk(dir: string): AsyncGenerator<string> {
   for await (const d of await fs.promises.opendir(dir)) {
@@ -29,12 +31,20 @@ function isImage(ext: string) {
   );
 }
 
-function isVideo(ext: string) {
-  return ext === ".mp4" || ext === ".mov" || ext === ".m4v";
+function ignoreExt(ext: string) {
+  return ext.trim() === "" || ext.endsWith("_original");
 }
 
-async function tryGetTimestampFromJson(p: string): Promise<string> {
-  let datetime = "";
+function ignoreDir(dir: string) {
+  return dir.includes("/Bin/") || dir.includes("/Archive/");
+}
+
+function isVideo(ext: string) {
+  return ext === ".mp4" || ext === ".mov" || ext === ".m4v" || ext === ".avi";
+}
+
+async function tryGetTimestampFromJson(p: string): Promise<Date | null> {
+  let datetime = null;
   if (fs.existsSync(p + ".json")) {
     const stringData = await fs.promises.readFile(p + ".json", "utf8");
 
@@ -43,24 +53,23 @@ async function tryGetTimestampFromJson(p: string): Promise<string> {
     const timestamp = data.photoTakenTime?.timestamp;
 
     // fix
-    datetime = timestamp;
+    datetime = fromUnixTime(timestamp);
   }
 
   return datetime;
 }
 
-const noDatePaths: string[] = [];
-const notHandledPaths: string[] = [];
+async function fixFiles(totalFiles: number) {
+  const progress = new SingleBar({});
+  progress.start(totalFiles, 0);
 
-async function fileCheck() {
   for await (const p of walk(root)) {
     const ext = path.extname(p).toLocaleLowerCase();
     const fileName = path.basename(p);
-    const directoryName = path.dirname(p);
 
-    console.log("checking " + p);
+    // console.log("checking " + p);
 
-    if (!ext) {
+    if (ignoreExt(ext) || ignoreDir(p)) {
       continue;
     }
 
@@ -72,23 +81,41 @@ async function fileCheck() {
       let dateTime = await tryGetTimestampFromJson(p);
 
       if (!dateTime) {
-        console.log("no datetime for: ", p);
-        noDatePaths.push(p);
+        // console.log("no datetime for: ", p);
+        await fs.promises.rename(
+          p,
+          getAvailableFilePath("output/unknown/" + fileName)
+        );
       }
+
+      if (dateTime) {
+        await fs.promises.utimes(p, dateTime, dateTime);
+        await fs.promises.rename(
+          p,
+          getAvailableFilePath("output/all/" + fileName)
+        );
+      }
+
+      progress.increment();
 
       continue;
     }
 
     if (isImage(ext)) {
-      let dateTime = "";
-      const exif = await exiftool.read(p);
-      if (exif.DateTimeOriginal) {
-        if (typeof exif.DateTimeOriginal === "string") {
-          dateTime = exif.DateTimeOriginal;
-        } else {
-          //   console.log("is date object");
-          dateTime = exif.DateTimeOriginal.toExifString();
+      let dateTime = null;
+
+      try {
+        const exif = await exiftool.read(p);
+        if (exif.DateTimeOriginal) {
+          if (typeof exif.DateTimeOriginal === "string") {
+            dateTime = parseISO(exif.DateTimeOriginal);
+          } else {
+            //   console.log("is date object");
+            dateTime = exif.DateTimeOriginal.toDate();
+          }
         }
+      } catch (err) {
+        console.error("failed to extract exif: ", p);
       }
 
       if (!dateTime) {
@@ -96,24 +123,126 @@ async function fileCheck() {
       }
 
       if (!dateTime) {
-        noDatePaths.push(p);
-        console.log("no date for: ", p);
+        // console.log("no date for: ", p);
+        await fs.promises.rename(
+          p,
+          getAvailableFilePath("output/unknown/" + fileName)
+        );
       }
+
+      if (dateTime) {
+        try {
+          await exiftool.write(p, {
+            DateTimeOriginal: ExifDateTime.fromISO(dateTime.toISOString()),
+          });
+        } catch (err) {
+          console.error("failed to write exif: ", dateTime, p);
+        }
+        await fs.promises.utimes(p, dateTime, dateTime);
+        await fs.promises.rename(
+          p,
+          getAvailableFilePath("output/all/" + fileName)
+        );
+      }
+      progress.increment();
+
+      continue;
+    }
+  }
+
+  progress.stop();
+}
+
+async function countFiles() {
+  let count = 1;
+  const notHandledPaths: string[] = [];
+  for await (const p of walk(root)) {
+    const ext = path.extname(p).toLocaleLowerCase();
+
+    if (ignoreExt(ext) || ignoreDir(p)) {
+      continue;
+    }
+
+    if (isJson(ext)) {
+      continue;
+    }
+
+    if (isVideo(ext)) {
+      count++;
+      continue;
+    }
+
+    if (isImage(ext)) {
+      count++;
       continue;
     }
 
     notHandledPaths.push(p);
   }
+
+  return { count, notHandledPaths };
 }
 
-await fileCheck();
+async function removeEdited() {
+  for await (const p of walk(root)) {
+    const ext = path.extname(p).toLocaleLowerCase();
 
-console.log("Files with no date:", noDatePaths.join());
-console.log("Files not handled:", notHandledPaths.join());
+    if (ignoreExt(ext) || ignoreDir(p)) {
+      continue;
+    }
 
-// todo
+    if (isJson(ext)) {
+      continue;
+    }
 
-// fs.utimesSync("",)
-// ignore if has edited
+    const editedFileName = `${path.dirname(p)}/${path.basename(
+      p,
+      path.extname(p)
+    )}-edited${path.extname(p)}`;
 
-//data/Takeout/Google Photos/Photos from 2018/IMG_20180710_152826_924.jpg
+    if (isVideo(ext)) {
+      if (fs.existsSync(editedFileName)) {
+        fs.unlinkSync(editedFileName);
+        console.log("deleted: ", editedFileName);
+      }
+      continue;
+    }
+
+    if (isImage(ext)) {
+      if (fs.existsSync(editedFileName)) {
+        fs.unlinkSync(editedFileName);
+        console.log("deleted: ", editedFileName);
+      }
+
+      continue;
+    }
+  }
+}
+
+function getAvailableFilePath(filePath: string) {
+  const basePath = path.dirname(filePath);
+  const fileName = path.basename(filePath);
+  const fileExtension = path.extname(fileName);
+
+  let i = 1;
+  while (fs.existsSync(filePath)) {
+    const newFilePath = path.join(
+      basePath,
+      `${fileName.slice(0, -fileExtension.length)}_${i}${fileExtension}`
+    );
+    i++;
+    filePath = newFilePath;
+  }
+
+  return filePath;
+}
+
+await removeEdited();
+
+const { count, notHandledPaths } = await countFiles();
+
+if (notHandledPaths.length > 0) {
+  console.log("Files not handled:\n", notHandledPaths.join("\n"));
+} else {
+  await fixFiles(count);
+}
